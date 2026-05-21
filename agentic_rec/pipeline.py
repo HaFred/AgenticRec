@@ -14,7 +14,7 @@ from .agents import (
 )
 from .core import AgentMessage, Item, Memory, ToolRegistry, Trace
 from .llm import BaseLLM, MockLLM
-from .tools import BizRuleTool, FeatureTool, HotTool, TagTool, VectorTool
+from .tools import BizRuleTool, FeatureTool, GBDTTool, HotTool, TagTool, TwoTowerTool, VectorTool
 
 
 @dataclass
@@ -44,6 +44,8 @@ class AgenticPipeline:
             self.tools.register(VectorTool(corpus))
             self.tools.register(TagTool(corpus))
             self.tools.register(HotTool(corpus))
+            self.tools.register(TwoTowerTool(corpus))
+            self.tools.register(GBDTTool(corpus))
             self.tools.register(FeatureTool(corpus))
             self.tools.register(BizRuleTool())
 
