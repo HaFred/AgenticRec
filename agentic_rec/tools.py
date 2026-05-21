@@ -172,6 +172,63 @@ class TwoTowerTool(Tool):
 
 
 # ---------------------------------------------------------------------------
+class GBDTTool(Tool):
+    """Deterministic lightweight GBDT ranker.
+
+    Mimics a small gradient-boosted decision tree ensemble with fixed
+    decision stumps over four features: ctr_prior, freshness, hot, tag_count.
+    Score = sigmoid(sum of weighted stump decisions).
+    """
+
+    name = "gbdt"
+    description = "lightweight GBDT ranking via deterministic feature stumps"
+
+    # Fixed "stumps": (feature_index, threshold, weight)
+    # feature order: ctr_prior, freshness, log_hot_norm, tag_count_norm
+    STUMPS = [
+        (0, 0.12, 0.8),   # ctr_prior > 12% → boost
+        (0, 0.08, 0.4),   # ctr_prior > 8% → moderate boost
+        (1, 0.5,  0.6),   # freshness > 0.5 → boost
+        (1, 0.3,  0.3),   # freshness > 0.3 → moderate
+        (2, 0.4,  0.5),   # log_hot > 0.4 → boost
+        (3, 0.3,  0.4),   # tag_count_norm > 0.3 → boost
+        (3, 0.1,  0.2),   # tag_count_norm > 0.1 → slight boost
+    ]
+
+    def __init__(self, corpus: List[Dict[str, Any]]) -> None:
+        self._idx = {c["id"]: c for c in corpus}
+
+    def _extract_features(self, item: Dict[str, Any], tag_count: int = 0) -> List[float]:
+        """Extract normalized feature vector from item dict."""
+        ctr = float(item.get("ctr_prior", 0))
+        freshness = float(item.get("freshness", 0))
+        hot = float(item.get("hot", 0))
+        log_hot = math.log1p(hot) / 10.0  # normalize to ~[0, 1]
+        tag_norm = min(1.0, tag_count / 5.0)
+        return [ctr, freshness, log_hot, tag_norm]
+
+    def __call__(self, item_ids: List[str], **_: Any) -> Dict[str, float]:
+        scores: Dict[str, float] = {}
+        for iid in item_ids:
+            c = self._idx.get(iid)
+            if c is None:
+                scores[iid] = 0.0
+                continue
+            tag_count = len(c.get("tags", []))
+            feats = self._extract_features(c, tag_count)
+
+            # Sum weighted stump decisions
+            total = 0.0
+            for feat_idx, threshold, weight in self.STUMPS:
+                if feats[feat_idx] > threshold:
+                    total += weight
+
+            # Sigmoid activation
+            scores[iid] = 1.0 / (1.0 + math.exp(-total + 1.0))
+        return scores
+
+
+# ---------------------------------------------------------------------------
 class BizRuleTool(Tool):
     """Business rules executed during rerank (dedup, boost, insert ads, etc.)."""
 
