@@ -61,28 +61,159 @@ class RecallAgent(BaseAgent):
 
 # ---------------------------------------------------------------------------
 class RankAgent(BaseAgent):
+    """Coarse ranking with LLM-controlled fusion of two-tower + GBDT scores.
+
+    The LLM receives candidate set statistics (count, score distribution,
+    tag diversity) and returns a JSON fusion config. Tools run
+    deterministically; the LLM controls *how* they're combined and
+    whether to trigger reflection for pathological distributions.
+    """
+
     name = "RankAgent"
     SKIP_THRESHOLD = 200
 
+    # Default fusion weights used when LLM is unavailable or fails
+    DEFAULT_WEIGHTS = {"w_tower": 0.4, "w_gbdt": 0.4, "w_orig": 0.2}
+
+    def _candidate_stats(self, items: List[Item]) -> Dict[str, Any]:
+        """Summarise candidate set for the LLM prompt."""
+        from collections import Counter
+
+        scores = [it.score for it in items]
+        tag_counter: Counter = Counter()
+        for it in items:
+            for t in it.features.get("tags", []):
+                tag_counter[t] += 1
+
+        top_tag, top_cnt = tag_counter.most_common(1)[0] if tag_counter else ("none", 0)
+
+        return {
+            "count": len(items),
+            "score_min": round(min(scores), 4),
+            "score_max": round(max(scores), 4),
+            "score_avg": round(sum(scores) / len(scores), 4),
+            "top_tag": top_tag,
+            "tag_concentration": round(top_cnt / len(items), 3) if items else 0,
+            "unique_tags": len(tag_counter),
+        }
+
+    def _build_prompt(self, stats: Dict[str, Any]) -> str:
+        """Build the LLM prompt requesting a fusion config."""
+        return (
+            "You are a coarse ranking controller in a recommendation system.\n"
+            f"Candidate set: {stats['count']} items\n"
+            f"Score range: [{stats['score_min']}, {stats['score_max']}], "
+            f"avg={stats['score_avg']}\n"
+            f"Top tag: '{stats['top_tag']}' (concentration={stats['tag_concentration']})\n"
+            f"Unique tags: {stats['unique_tags']}\n\n"
+            "Decide the fusion weights and whether to reflect. Reply with ONLY valid JSON:\n"
+            '{"skip": false, "w_tower": 0.4, "w_gbdt": 0.4, "w_orig": 0.2, "reflect": false}\n\n'
+            "Rules:\n"
+            "- skip=true if the candidate set is very small or already well-scored\n"
+            "- w_tower + w_gbdt + w_orig should sum to 1.0\n"
+            "- reflect=true if tag concentration > 0.7 (distribution abnormal, all same tag)\n"
+            "- w_tower should be high when user-tag match matters; w_gbdt high for feature-driven ranking"
+        )
+
+    def _parse_llm_config(self, thought: str) -> Dict[str, Any]:
+        """Parse JSON from LLM response, falling back per-field."""
+        import json as _json
+
+        config = dict(self.DEFAULT_WEIGHTS, skip=False, reflect=False)
+
+        try:
+            # Extract JSON object from response (may have surrounding text)
+            start = thought.find("{")
+            end = thought.rfind("}")
+            if start >= 0 and end > start:
+                parsed = _json.loads(thought[start:end + 1])
+                config.update(parsed)
+        except (ValueError, _json.JSONDecodeError):
+            pass  # fall back to defaults
+
+        # Normalise weights to sum to 1.0
+        w_sum = config.get("w_tower", 0) + config.get("w_gbdt", 0) + config.get("w_orig", 0)
+        if w_sum > 0:
+            config["w_tower"] = config.get("w_tower", 0.4) / w_sum
+            config["w_gbdt"] = config.get("w_gbdt", 0.4) / w_sum
+            config["w_orig"] = config.get("w_orig", 0.2) / w_sum
+
+        return config
+
     def step(self, msg: AgentMessage, ctx: Dict[str, Any]) -> Decision:
         items: List[Item] = msg.content.get("items", [])
-        # Reflection: skip if candidate set already small
-        if len(items) <= self.SKIP_THRESHOLD:
-            thought = f"skip coarse ranking, candidates={len(items)} <= {self.SKIP_THRESHOLD}"
-            return Decision(agent=self.name, thought=thought, action="skip", payload=items)
 
-        # Otherwise apply a lite scoring (combine source signals + features)
-        feat = self.tools.get("feature") if "feature" in self.tools.names() else None
-        if feat:
+        # 1) Stats for LLM
+        stats = self._candidate_stats(items)
+
+        # 2) LLM decides fusion config
+        if self.llm:
+            prompt = self._build_prompt(stats)
+            thought = self.llm.chat([{"role": "user", "content": prompt}])
+        else:
+            thought = "no LLM, using defaults"
+        config = self._parse_llm_config(thought)
+
+        # 3) Skip gate
+        if config.get("skip") or len(items) <= self.SKIP_THRESHOLD:
+            if len(items) <= self.SKIP_THRESHOLD:
+                return Decision(
+                    agent=self.name,
+                    thought=f"skip coarse ranking, candidates={len(items)} <= {self.SKIP_THRESHOLD}",
+                    action="skip", payload=items,
+                )
+
+        # 4) Run TwoTower tool
+        tower_scores: Dict[str, float] = {}
+        tt = self.tools.get("two_tower") if "two_tower" in self.tools.names() else None
+        if tt:
+            prof = self.memory.profile_of(ctx["user_id"])
             ids = [it.id for it in items]
-            extra = feat(item_ids=ids)
-            for it in items:
-                e = extra.get(it.id, {})
-                it.score = 0.5 * it.score + 0.5 * float(e.get("ctr_prior", 0))
+            tower_scores = tt(item_ids=ids, user_profile=prof)
+
+        # 5) Run GBDT tool
+        gbdt_scores: Dict[str, float] = {}
+        gbt = self.tools.get("gbdt") if "gbdt" in self.tools.names() else None
+        if gbt:
+            ids = [it.id for it in items]
+            gbdt_scores = gbt(item_ids=ids)
+
+        # 6) Fuse scores
+        w_tower = config.get("w_tower", self.DEFAULT_WEIGHTS["w_tower"])
+        w_gbdt = config.get("w_gbdt", self.DEFAULT_WEIGHTS["w_gbdt"])
+        w_orig = config.get("w_orig", self.DEFAULT_WEIGHTS["w_orig"])
+
+        for it in items:
+            s_tower = tower_scores.get(it.id, 0.0)
+            s_gbdt = gbdt_scores.get(it.id, 0.0)
+            it.score = w_tower * s_tower + w_gbdt * s_gbdt + w_orig * it.score
+
+        # 7) Sort & truncate
         items.sort(key=lambda x: -x.score)
+
+        # 8) Reflection: if tag concentration is high, boost minority-tag items
+        if config.get("reflect") and stats["tag_concentration"] > 0.7:
+            from collections import Counter
+            tag_counter: Counter = Counter()
+            for it in items:
+                for t in it.features.get("tags", []):
+                    tag_counter[t] += 1
+            dominant_tag = tag_counter.most_common(1)[0][0] if tag_counter else None
+            if dominant_tag:
+                boost = [it for it in items
+                         if dominant_tag not in it.features.get("tags", [])]
+                for it in boost:
+                    it.score *= 1.15  # moderate diversity boost
+                items.sort(key=lambda x: -x.score)
+
         kept = items[: self.SKIP_THRESHOLD]
-        return Decision(agent=self.name, thought=f"lite-rank, kept={len(kept)}",
-                        action="rank", payload=kept)
+        return Decision(
+            agent=self.name,
+            thought=f"LLM fusion: w_tower={w_tower:.2f} w_gbdt={w_gbdt:.2f} "
+                    f"w_orig={w_orig:.2f} reflect={config.get('reflect')} | "
+                    f"kept={len(kept)}",
+            action="rank", payload=kept,
+        )
 
 
 # ---------------------------------------------------------------------------
