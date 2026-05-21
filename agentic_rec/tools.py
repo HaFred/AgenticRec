@@ -114,6 +114,64 @@ class FeatureTool(Tool):
 
 
 # ---------------------------------------------------------------------------
+class TwoTowerTool(Tool):
+    """Deterministic two-tower model: user embedding dot item embedding.
+
+    User tower: hashes user profile tags into a fixed 16-dim vector.
+    Item tower: hashes item features (tags, author, category) into 16-dim.
+    Score = cosine similarity of the two L2-normalized vectors.
+    """
+
+    name = "two_tower"
+    description = "two-tower relevance scoring via deterministic embeddings"
+
+    DIM = 16
+
+    def __init__(self, corpus: List[Dict[str, Any]]) -> None:
+        self._idx = {c["id"]: c for c in corpus}
+
+    def _embed(self, tokens: List[str]) -> List[float]:
+        """Hash a list of tokens into a DIM-dimensional vector."""
+        vec = [0.0] * self.DIM
+        if not tokens:
+            return vec
+        for i in range(self.DIM):
+            val = 0.0
+            for t in tokens:
+                val += _h(f"{t}|{i}", 1000) / 1000.0
+            vec[i] = val / max(1, len(tokens))
+        # L2-normalize
+        norm = math.sqrt(sum(v * v for v in vec))
+        if norm > 0:
+            vec = [v / norm for v in vec]
+        return vec
+
+    def __call__(
+        self,
+        item_ids: List[str],
+        user_profile: Optional[Dict[str, Any]] = None,
+        **_: Any,
+    ) -> Dict[str, float]:
+        user_profile = user_profile or {}
+        user_tags = list(user_profile.get("tags", {}).keys())
+
+        user_vec = self._embed(user_tags)
+
+        scores: Dict[str, float] = {}
+        for iid in item_ids:
+            c = self._idx.get(iid)
+            if c is None:
+                scores[iid] = 0.0
+                continue
+            item_tokens = c.get("tags", []) + [c.get("author", ""), c.get("category", "")]
+            item_vec = self._embed(item_tokens)
+            # Cosine similarity (vectors already L2-normalized)
+            sim = sum(u * v for u, v in zip(user_vec, item_vec))
+            scores[iid] = max(0.0, min(1.0, (sim + 1.0) / 2.0))
+        return scores
+
+
+# ---------------------------------------------------------------------------
 class BizRuleTool(Tool):
     """Business rules executed during rerank (dedup, boost, insert ads, etc.)."""
 
