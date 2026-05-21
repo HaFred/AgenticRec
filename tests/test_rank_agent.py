@@ -98,3 +98,24 @@ class TestRankAgentFallback:
         d = agent.step(msg, ctx)
         assert d.action == "rank"
         assert len(d.payload) <= agent.SKIP_THRESHOLD
+
+
+class TestRankAgentLLMConfig:
+    def test_llm_with_valid_json_controls_fusion(self):
+        """When LLM returns valid JSON config, those weights should be used."""
+        agent = make_agent()
+        agent.SKIP_THRESHOLD = 5
+
+        class ConfigLLM:
+            name = "config"
+            def chat(self, messages, **kwargs):
+                return '{"w_tower": 0.0, "w_gbdt": 1.0, "w_orig": 0.0, "reflect": false}'
+
+        agent.llm = ConfigLLM()
+        items = make_items([f"mv_{i:04d}" for i in range(10)])
+        msg = AgentMessage("orch", "RankAgent", "request", content={"items": items})
+        ctx = {"query": "test", "user_id": "u1", "scene": "feed_home"}
+        d = agent.step(msg, ctx)
+        assert d.action == "rank"
+        # Should use GBDT-only weights, mentioned in thought
+        assert "w_gbdt=1.00" in d.thought

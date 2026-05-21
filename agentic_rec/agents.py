@@ -6,6 +6,7 @@ get real reasoning.
 """
 from __future__ import annotations
 
+from collections import Counter
 from typing import Any, Dict, List
 
 from .core import AgentMessage, BaseAgent, Decision, Item
@@ -77,7 +78,6 @@ class RankAgent(BaseAgent):
 
     def _candidate_stats(self, items: List[Item]) -> Dict[str, Any]:
         """Summarise candidate set for the LLM prompt."""
-        from collections import Counter
 
         scores = [it.score for it in items]
         tag_counter: Counter = Counter()
@@ -156,12 +156,16 @@ class RankAgent(BaseAgent):
 
         # 3) Skip gate
         if config.get("skip") or len(items) <= self.SKIP_THRESHOLD:
-            if len(items) <= self.SKIP_THRESHOLD:
-                return Decision(
-                    agent=self.name,
-                    thought=f"skip coarse ranking, candidates={len(items)} <= {self.SKIP_THRESHOLD}",
-                    action="skip", payload=items,
-                )
+            reason = (
+                f"skip coarse ranking, candidates={len(items)} <= {self.SKIP_THRESHOLD}"
+                if len(items) <= self.SKIP_THRESHOLD
+                else "skip coarse ranking, LLM decided skip"
+            )
+            return Decision(
+                agent=self.name,
+                thought=reason,
+                action="skip", payload=items,
+            )
 
         # 4) Run TwoTower tool
         tower_scores: Dict[str, float] = {}
@@ -193,7 +197,6 @@ class RankAgent(BaseAgent):
 
         # 8) Reflection: if tag concentration is high, boost minority-tag items
         if config.get("reflect") and stats["tag_concentration"] > 0.7:
-            from collections import Counter
             tag_counter: Counter = Counter()
             for it in items:
                 for t in it.features.get("tags", []):
@@ -265,7 +268,6 @@ class CriticAgent(BaseAgent):
             return Decision(agent=self.name, thought="empty result, veto",
                             action="veto", payload=True)
         # Check tag concentration
-        from collections import Counter
         cats = Counter()
         for it in items:
             for t in it.features.get("tags", []):
